@@ -1,53 +1,45 @@
 #!/bin/bash
-# =========================================
-# NTP / Multichronyd Installer & Manager
-# Full Install / Uninstall / Hot-Reload / Reset
-# =========================================
 
-CONFIG_FILE="/etc/multichronyd.conf"
-SERVICE_FILE="/etc/systemd/system/multichronyd.service"
-SCRIPT_FILE="/root/multichronyd.sh"
-
+# This script must be run as root
 if [ "$EUID" -ne 0 ]; then
-    echo "Please run as root"
-    exit 1
+  echo "Please run as root"
+  exit 1
 fi
 
-echo "### MULTICHRONYD INSTALLER & MANAGER ###"
-echo "Choose an option:"
-echo "1) Install / Reinstall (reset chrony config)"
-echo "2) Uninstall Multichronyd only"
-echo "3) Uninstall Multichronyd + chrony/NTP completely"
-echo "4) Change number of cores (server instances)"
-read -p "Enter choice [1-4]: " CHOICE
-
-case "$CHOICE" in
-1)
-    # ---------------- Install / Reinstall ----------------
-    read -p "Enter number of chronyd server instances to run (1 recommended for high-core VPS): " NUM
-    NUM=${NUM:-1}
-    echo "$NUM" > "$CONFIG_FILE"
-
-    echo "### Installing chrony and inotify-tools... ###"
-    apt update
-    apt install -y chrony inotify-tools
-
-    # Stop default chrony service
-    systemctl stop chrony.service
+echo "### Step 1: Checking for and stopping existing Chrony services... ###"
+if systemctl is-active --quiet multichronyd.service; then
+    echo "An existing multichronyd.service is active. Stopping it now..."
+    systemctl disable multichronyd.service
+fi
+if systemctl is-active --quiet chrony.service; then
+    echo "The default chrony.service is active. Stopping it now..."
     systemctl disable chrony.service
+fi
 
-    # Remove old config/log/drift/pid/sock
-    echo "Cleaning old chrony/multichronyd data..."
-    rm -f /etc/chrony/chrony.conf /etc/chrony/chrony.conf.bak
-    rm -f /var/lib/chrony/chrony.drift
-    rm -rf /var/log/chrony
-    rm -rf /var/run/chrony
-    mkdir -p /var/run/chrony
-    chmod 1777 /var/run/chrony
-    chown root:root /var/run/chrony
+echo
+echo "### Step 2: Configure CPU core usage ###"
+TOTAL_CORES=$(nproc)
+while true; do
+    read -p "Enter the number of CPU cores to use (1-${TOTAL_CORES}, default: ${TOTAL_CORES}): " CPU_CORES
+    CPU_CORES=${CPU_CORES:-$TOTAL_CORES}
+    if [[ "$CPU_CORES" =~ ^[1-9][0-9]*$ ]] && [ "$CPU_CORES" -le "$TOTAL_CORES" ]; then
+        echo "Configuration accepted. Will use $CPU_CORES core(s)."
+        break
+    else
+        echo "Invalid input. Please enter a number between 1 and ${TOTAL_CORES}."
+    fi
+done
 
-    # Create new chrony.conf
-    cat << 'EOF' > /etc/chrony/chrony.conf
+echo
+echo "### Step 3: Updating packages and installing Chrony... ###"
+apt update
+apt install -y chrony
+
+echo
+echo "### Step 4: Configuring Chrony... ###"
+# The chrony.conf part remains the same
+cat << 'EOF' > /etc/chrony/chrony.conf
+# ---- BEST PRACTICE UPDATE ----
 server time.cloudflare.com iburst
 server time.aws.com iburst
 server time.google.com iburst
@@ -66,154 +58,109 @@ server time.kriss.re.kr iburst
 server ntp.hko.hk iburst
 server ntp.aarnet.edu.au iburst
 allow
-driftfile /var/lib/chrony/chrony.drift
+sourcedir /run/chrony-dhcp
+sourcedir /etc/chrony/sources.d
 keyfile /etc/chrony/chrony.keys
+driftfile /var/lib/chrony/chrony.drift
+ntsdumpdir /var/lib/chrony
 logdir /var/log/chrony
+maxupdateskew 100.0
 rtcsync
 makestep 1.0 3
 sched_priority 1
 EOF
 
-    # Create multichronyd script
-    cat << 'EOF' > "$SCRIPT_FILE"
+echo
+echo "### Step 5: Disabling the default Chrony service to prevent conflicts... ###"
+systemctl disable chrony.service > /dev/null 2>&1
+
+echo
+echo "### Step 6: Creating the FIXED multichronyd.sh script in /root... ###"
+cat << EOF > /root/multichronyd.sh
 #!/bin/bash
-CONFIG_FILE="/etc/multichronyd.conf"
-CHRONYD="/usr/sbin/chronyd"
+
+servers=${CPU_CORES}
+chronyd="/usr/sbin/chronyd"
+
+trap terminate SIGINT SIGTERM
+
+terminate()
+{
+  for p in /var/run/chrony/chronyd*.pid; do
+    pid=\$(cat "\$p" 2> /dev/null)
+    [[ "\$pid" =~ [0-9]+ ]] && kill "\$pid"
+  done
+}
+
+conf=""
+for c in /etc/chrony.conf /etc/chrony/chrony.conf; do
+  [ -f "\$c" ] && conf=\$c
+done
+
+case "\$(\"\$chronyd\" --version | grep -o -E '[1-9]\.[0-9]+')" in
+  1.*|2.*|3.*)
+    echo "chrony version too old to run multiple instances"
+    exit 1;;
+  4.0)  opts="";;
+  4.1)  opts="xleave copy";;
+  *)  opts="xleave copy extfield F323";;
+esac
 
 mkdir -p /var/run/chrony
-chmod 1777 /var/run/chrony
-chown root:root /var/run/chrony
 
-log() { echo "[`date '+%F %T'`] $*"; }
-declare -A PID_MAP
-
-start_client() {
-    "$CHRONYD" -n include /etc/chrony/chrony.conf port 11123 bindaddress 127.0.0.1 sched_priority 1 allow 127.0.0.1 &
-    CLIENT_PID=$!
-    log "Client instance started: PID $CLIENT_PID"
-}
-
-start_server() {
-    local i=$1
-    "$CHRONYD" -x -n \
-        "server 127.0.0.1 port 11123 minpoll 0 maxpoll 0" \
-        "allow" \
-        "cmdport 0" \
-        "bindcmdaddress /var/run/chrony/chronyd-server$i.sock" \
-        "pidfile /var/run/chrony/chronyd-server$i.pid" &
-    PID_MAP[$i]=$!
-    sleep 0.5
-    chmod 777 /var/run/chrony/chronyd-server$i.sock
-    log "Server instance #$i started: PID ${PID_MAP[$i]}"
-}
-
-stop_server() {
-    local i=$1
-    local pidfile="/var/run/chrony/chronyd-server$i.pid"
-    if [ -f "$pidfile" ]; then
-        pid=$(cat "$pidfile")
-        kill "$pid" 2>/dev/null
-        rm -f "$pidfile" "/var/run/chrony/chronyd-server$i.sock"
-        log "Server instance #$i stopped"
-        unset PID_MAP[$i]
-    fi
-}
-
-start_client
-
-NUM_SERVERS=$(cat "$CONFIG_FILE" 2>/dev/null)
-NUM_SERVERS=${NUM_SERVERS:-1}
-for i in $(seq 1 "$NUM_SERVERS"); do
-    start_server $i
+for i in \$(seq 1 "\$servers"); do
+  echo "Starting server instance #\$i"
+  "\$chronyd" "\$@" -n -x \\
+    "server 127.0.0.1 port 11123 minpoll 0 maxpoll 0 \$opts" \\
+    "allow" \\
+    "cmdport 0" \\
+    "bindcmdaddress /var/run/chrony/chronyd-server\$i.sock" \\
+    "pidfile /var/run/chrony/chronyd-server\$i.pid" &
 done
 
-while inotifywait -e modify "$CONFIG_FILE" >/dev/null 2>&1; do
-    NEW_NUM=$(cat "$CONFIG_FILE" 2>/dev/null)
-    if [ "$NEW_NUM" != "$NUM_SERVERS" ]; then
-        log "Config change detected: $NUM_SERVERS -> $NEW_NUM"
-        if [ "$NEW_NUM" -gt "$NUM_SERVERS" ]; then
-            for i in $(seq $((NUM_SERVERS+1)) "$NEW_NUM"); do
-                start_server $i
-            done
-        else
-            for i in $(seq $((NEW_NUM+1)) "$NUM_SERVERS"); do
-                stop_server $i
-            done
-        fi
-        NUM_SERVERS=$NEW_NUM
-    fi
-done
+echo "Starting client instance"
+"\$chronyd" "\$@" -n \\
+  "include \$conf" \\
+  "pidfile /var/run/chrony/chronyd-client.pid" \\
+  "port 11123" \\
+  "bindaddress 127.0.0.1" \\
+  "sched_priority 1" \\
+  "allow 127.0.0.1" &
+
+wait
+
+echo Exiting
 EOF
 
-    chmod +x "$SCRIPT_FILE"
+echo "### Step 7: Making the script executable... ###"
+chmod +x /root/multichronyd.sh
 
-    # Create systemd service
-    cat << 'EOF' > "$SERVICE_FILE"
+echo
+echo "### Step 8: Creating the systemd service file... ###"
+cat << 'EOF' > /etc/systemd/system/multichronyd.service
 [Unit]
-Description=Custom Chronyd Service Manager with Immediate Hot-Reload
+Description=Custom Chronyd Service Manager
 After=network.target
 
 [Service]
-Type=simple
 User=root
 Group=root
 WorkingDirectory=/root
 ExecStart=/root/multichronyd.sh
 Restart=always
-RestartSec=5s
-StandardOutput=journal+console
-StandardError=journal+console
+RestartSec=10s
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-    systemctl daemon-reload
-    systemctl enable multichronyd.service
-    systemctl restart multichronyd.service
+echo
+echo "### Step 9: Enabling and starting the new multichronyd service... ###"
+systemctl daemon-reload
+systemctl enable multichronyd.service
+systemctl start multichronyd.service
 
-    echo "### Immediate Hot-Reload multichronyd installed! ###"
-    echo "Check status: systemctl status multichronyd.service"
-    echo "Change number of server instances instantly: echo <num> > /etc/multichronyd.conf"
-    ;;
-2)
-    # ---------------- Uninstall Multichronyd only ----------------
-    echo "Stopping service..."
-    systemctl stop multichronyd.service
-    systemctl disable multichronyd.service
-    rm -f "$SERVICE_FILE" "$SCRIPT_FILE" "$CONFIG_FILE"
-    echo "Multichronyd uninstalled successfully."
-    ;;
-3)
-    # ---------------- Uninstall Multichronyd + chrony/NTP completely ----------------
-    echo "Stopping service..."
-    systemctl stop multichronyd.service
-    systemctl disable multichronyd.service
-    rm -f "$SERVICE_FILE" "$SCRIPT_FILE" "$CONFIG_FILE"
-    echo "Removing chrony and inotify-tools packages..."
-    apt remove -y chrony inotify-tools
-    apt autoremove -y
-    echo "Removing all chrony data..."
-    rm -f /etc/chrony/chrony.conf /etc/chrony/chrony.conf.bak
-    rm -f /var/lib/chrony/chrony.drift
-    rm -rf /var/log/chrony
-    rm -rf /var/run/chrony
-    echo "Multichronyd + chrony/NTP uninstalled completely."
-    ;;
-4)
-    # ---------------- Change cores ----------------
-    if [ ! -f "$CONFIG_FILE" ]; then
-        echo "Multichronyd is not installed yet."
-        exit 1
-    fi
-    read -p "Enter new number of server instances: " NUM
-    NUM=${NUM:-1}
-    echo "$NUM" > "$CONFIG_FILE"
-    systemctl restart multichronyd.service
-    echo "Server instances updated and service restarted."
-    ;;
-*)
-    echo "Invalid choice."
-    exit 1
-    ;;
-esac
+echo
+echo "### All done! ###"
+echo "The corrected multichronyd service is now running using $CPU_CORES core(s)."
+echo "You can check its status with: systemctl status multichronyd.service"
